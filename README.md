@@ -3,7 +3,7 @@
 
 
 
-*Easy download YouTube* 
+# Easy download YouTube #
 
 ---
 
