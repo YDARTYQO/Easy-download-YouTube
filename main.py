@@ -7,7 +7,7 @@ import re
 from datetime import datetime
 import uuid
 import webbrowser
-
+import json
 # pip install flet requests pyinstaller
 
 default_dir = os.path.join(os.path.expanduser("~"), "Videos", "Easy download YouTube")
@@ -24,6 +24,8 @@ LOG_FILE = "yt_dlp_log.txt"
 ffmpeg_actual = os.path.abspath(os.path.join("bin", "ffmpeg"))
 if os.name == "nt":
     ffmpeg_actual += ".exe"
+import urllib.parse
+
 
 import requests
 import urllib3
@@ -31,32 +33,13 @@ import urllib3
 # לבטל אזהרות SSL (אם צריך)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-import json
 
 def is_playlist(url):
     # בדיקה בסיסית: אם יש list= ב-URL
     return "list=" in url
 
-def get_playlist_video_urls(playlist_url):
-    try:
-        result = subprocess.run([
-            "yt-dlp", "--flat-playlist", "-J", "--no-check-certificate", playlist_url
-        ], capture_output=True, text=True)
-        if not result.stdout:
-            print("yt-dlp לא החזיר פלט")
-            print("stderr:", result.stderr)
-            return []
-        info = json.loads(result.stdout)
-        if not info or 'entries' not in info or not info['entries']:
-            print("אין entries בפלט של yt-dlp")
-            print("stderr:", result.stderr)
-            print("stdout:", result.stdout)
-            return []
-        return [entry['url'] for entry in info['entries'] if entry and 'url' in entry]
-    except Exception as e:
-        print(f"בעיה בשליפת פלייליסט: {e}")
-        return []
-    
+
+
 def get_title_by_scraping(url):
     headers = {'User-Agent': 'Mozilla/5.0'}
     resp = requests.get(url, headers=headers, verify=False)
@@ -326,7 +309,7 @@ def main(page: ft.Page):
         )
     )
 
-
+    download_mode = {"type": None}  # "playlist" או "single"
         
     url_input = ft.TextField(
         label="הדבק קישורים לסרטוני YouTube ",
@@ -379,7 +362,45 @@ def main(page: ft.Page):
         "תיקיית יעד", icon=ft.Icons.FOLDER_OPEN, bgcolor=SECONDARY, color=PRIMARY, on_click=choose_folder
     )
 
+    def show_playlist_dialog(url, download_attempts, do_download, title, thumbnail_url):
+        def handle_choice(e):
+            choice = e.control.text
+            page.close(banner)
+            if choice == "הורד את כל הפלייליסט":
+                video_urls = get_playlist_video_urls(url)
+                if not video_urls:
+                    show_snackbar(page, "לא נמצאו סרטונים בפלייליסט או שישנה שגיאה.", False)
+                    return
+                show_snackbar(page, f"נמצאו {len(video_urls)} סרטונים בפלייליסט, מתחיל להוריד...", True)
+                for i, v_url in enumerate(video_urls, 1):
+                    actual_url = f"https://www.youtube.com/watch?v={v_url}"
+                    actual_title, actual_thumbnail = fetch_title_and_thumbnail(actual_url)
+                    threading.Thread(
+                        target=do_download,
+                        args=(actual_url, actual_title, actual_thumbnail, download_attempts),
+                        daemon=True
+                    ).start()
+            elif choice == "הורד רק את הסרטון הזה":
+                    single_url = extract_single_video_url(url)
+                    threading.Thread(
+                        target=do_download,
+                        args=(single_url, title, thumbnail_url, download_attempts),
+                        daemon=True
+                    ).start()
 
+        action_button_style = ft.ButtonStyle(color=ft.Colors.BLUE)
+        banner = ft.Banner(
+            bgcolor=ft.Colors.AMBER_100,
+            leading=ft.Icon(ft.Icons.QUEUE_PLAY_NEXT, color=ft.Colors.AMBER, size=40),
+            content=ft.Text("זיהינו קישור לפלייליסט. מה תרצה להוריד?", color=ft.Colors.BLACK),
+            actions=[
+                ft.TextButton(text="הורד את כל הפלייליסט", style=action_button_style, on_click=handle_choice),
+                ft.TextButton(text="הורד רק את הסרטון הזה", style=action_button_style, on_click=handle_choice),
+                ft.TextButton(text="ביטול", style=action_button_style, on_click=lambda e: page.close(banner)),
+            ],
+        )
+        page.open(banner)
+        
     def open_log(e):
         try:
             os.startfile(LOG_FILE)
@@ -395,6 +416,34 @@ def main(page: ft.Page):
     )
     downloads_column = ft.Column(spacing=16, expand=True, scroll=ft.ScrollMode.ALWAYS)
 
+
+    def extract_single_video_url(youtube_url):
+        """
+        מקבלת קישור יוטיוב (גם מתוך פלייליסט) ומחזירה קישור לסרטון בודד.
+        """
+        parsed = urllib.parse.urlparse(youtube_url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if "v" not in qs:
+            return youtube_url  # לא נמצא מזהה סרטון, תחזיר את המקורי
+        video_id = qs["v"][0]
+        return f"https://www.youtube.com/watch?v={video_id}"
+
+    def get_playlist_video_urls(playlist_url):
+        import subprocess, json
+        result = subprocess.run([
+            "yt-dlp", "--flat-playlist", "--dump-single-json", "--no-check-certificate", playlist_url
+        ], capture_output=True, text=True)
+        try:
+            info = json.loads(result.stdout)
+            if not isinstance(info, dict) or 'entries' not in info:
+                print("yt-dlp did not return a dict:", result.stdout)
+                return []
+            entries = info['entries']
+            return [entry['id'] for entry in entries if entry and 'id' in entry]
+        except Exception as e:
+            print("yt-dlp error:", e, result.stdout)
+            return []
+    
     def on_download(e):
         # פיצול הקלט לרשימת קישורים
         urls = url_input.value.strip().splitlines()
@@ -517,19 +566,8 @@ def main(page: ft.Page):
 
             # תמיכה בפלייליסטים עבור כל קישור
             if is_playlist(url):
-                video_urls = get_playlist_video_urls(url)
-                if not video_urls:
-                    show_snackbar(page, "לא נמצאו סרטונים בפלייליסט או שישנה שגיאה.", False)
-                    continue
-                show_snackbar(page, f"נמצאו {len(video_urls)} סרטונים בפלייליסט, מתחיל להוריד...", True)
-                for i, v_url in enumerate(video_urls, 1):
-                    actual_url = f"https://www.youtube.com/watch?v={v_url}"
-                    actual_title, actual_thumbnail = fetch_title_and_thumbnail(actual_url)
-                    threading.Thread(
-                        target=do_download,
-                        args=(actual_url, actual_title, actual_thumbnail, download_attempts),
-                        daemon=True
-                    ).start()
+                # פתח דיאלוג בחירה – לא מתחיל מיד להוריד
+                show_playlist_dialog(url, download_attempts, do_download, title, thumbnail_url)
             else:
                 threading.Thread(
                     target=do_download,
@@ -593,7 +631,7 @@ def main(page: ft.Page):
         [
             icon_box(
                 ft.Image(
-                    src="https://img.icons8.com/ios-filled/100/000000/youtube-play.png",
+                    src="https://img.Icons8.com/ios-filled/100/000000/youtube-play.png",
                     width=48, height=48, fit=ft.ImageFit.CONTAIN
                 ),
                 open_youtube,
