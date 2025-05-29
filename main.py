@@ -19,6 +19,7 @@ PRIMARY = "#3CB371"
 SECONDARY = "#A8E6CF"
 TEXT = "#111111"
 WHITE = "#fff"
+ERROR_BG = "#FFEBEE"
 ERROR = "#d32f2f"
 LOG_FILE = "yt_dlp_log.txt"
 ffmpeg_actual = os.path.abspath(os.path.join("bin", "ffmpeg"))
@@ -70,6 +71,29 @@ def get_youtube_thumbnail_url(url):
         return f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
     return ""  # או כתובת לתמונה ברירת מחדל
 
+def extract_url_from_shortcut_file(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+        # Windows .url format
+        match = re.search(r"^URL=(.+)$", content, re.MULTILINE)
+        if match:
+            return match.group(1).strip()
+        # Linux .desktop format
+        match = re.search(r"^Exec=(.+)$", content, re.MULTILINE)
+        if match:
+            exec_line = match.group(1)
+            url_match = re.search(r"(https?://[^\s]+)", exec_line)
+            if url_match:
+                return url_match.group(1)
+        # fallback - כל לינק יוטיוב
+        yt_match = re.search(r"(https?://(www\.)?youtube\.com/[^\s]+|https?://youtu\.be/[^\s]+)", content)
+        if yt_match:
+            return yt_match.group(1)
+    except Exception as e:
+        print("Failed to extract url:", e)
+    return ""
+
 
 def write_log(msg):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
@@ -96,7 +120,8 @@ def run_download_with_cancel(
     page, url, format_option, output_dir,
     progress_bar, progress_text, status_text,
     show_snackbar_fn, on_done, download_id, cancel_event,
-    title, ext
+    title, ext,
+    row 
 ):
     try:
         cmd = format_option + [url]
@@ -122,6 +147,7 @@ def run_download_with_cancel(
         output_filename = None
 
         for line in process.stdout:
+
             if cancel_event.is_set():
                 process.terminate()
                 status_text.value = "בוטל ע\"י המשתמש"
@@ -189,6 +215,8 @@ def run_download_with_cancel(
     except Exception as e:
         status_text.value = "שגיאה כללית"
         status_text.update()
+        row.bgcolor = ERROR_BG
+        page.update()
         write_log(f"שגיאה כללית: {e}")
         show_snackbar_fn(page, "❌ שגיאה כללית. בדוק את הלוג.", False)
         return False
@@ -196,41 +224,22 @@ def run_download_with_cancel(
         if on_done:
             on_done()
 
-def add_download_row(page, downloads_column, url, title, thumbnail_url, format_option, dest_dir_value, ext, try_only=False):
+def add_download_row(
+    page, downloads_column, url, title, thumbnail_url,
+    download_attempts, dest_dir_value, ext, prev_row=None, try_only=False
+):
+    if prev_row and prev_row in downloads_column.controls:
+        downloads_column.controls.remove(prev_row)
+        page.update()
+
     download_id = str(uuid.uuid4())
     cancel_event = threading.Event()
-
-    # נניח thumbnail_url כבר קיים
     thumb = ft.Image(
         src=thumbnail_url if thumbnail_url else "assets/no_thumbnail.png",
         width=100, height=56,
         border_radius=8, fit=ft.ImageFit.COVER
     )
-
-    progress_anim = ft.Container(
-        ft.ProgressRing(width=32, height=32, color=PRIMARY),
-        alignment=ft.alignment.top_center,
-        padding=6,
-        visible=True  # תעדכן ל־False כשההורדה מסתיימת
-    )
-
-    thumb_stack = ft.Stack([
-        thumb,
-        progress_anim
-    ], width=100, height=56)
-
-    # בתוך ה־Row של הפס:
-    ft.Row([
-        ft.Container(
-            thumb_stack,
-            alignment=ft.alignment.center,
-            expand=True,
-            height=100
-        ),
-        ...
-    ], vertical_alignment=ft.CrossAxisAlignment.CENTER)
-
-    progress_bar = ft.ProgressBar(color=PRIMARY, bgcolor=SECONDARY, value=0, bar_height=58)#width=460, 
+    progress_bar = ft.ProgressBar(color=PRIMARY, bgcolor=SECONDARY, value=0, bar_height=58)
     progress_text = ft.Text("0%", size=16, color=PRIMARY, weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER, width=250)
     status_text = ft.Text("מוריד...", size=14, color=TEXT)
 
@@ -251,33 +260,40 @@ def add_download_row(page, downloads_column, url, title, thumbnail_url, format_o
 
     cancel_btn = ft.IconButton(ft.Icons.CANCEL, tooltip="ביטול", on_click=cancel_download)
     open_folder_btn = ft.IconButton(ft.Icons.FOLDER_OPEN, tooltip="פתח תיקיה", on_click=open_folder)
-    title, thumbnail_url = fetch_title_and_thumbnail(url)
-    if not title.strip() or title == "לא ידוע":
-        title = "הורדה"
 
-    row = ft.Container(
-        content=ft.Column([
-            ft.Text(title, size=17, weight=ft.FontWeight.BOLD, color=PRIMARY),
-            ft.Row([
-                thumb,
-                ft.Column([
-                    ft.Stack([
-                        progress_bar,
-                        ft.Container(progress_text, alignment=ft.alignment.center)
-                    ]),
-                    status_text
-                ], spacing=8,expand=True),  
-                ft.Column([cancel_btn, open_folder_btn], spacing=6, alignment=ft.MainAxisAlignment.END)
-            ], spacing=18, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-        ], spacing=10),
-        bgcolor="#E3F2FD",
-        border_radius=10,
-        padding=12,
-        margin=ft.Margin(0, 0, 0, 0),  # רווח מימין
-        #width=380,  # או פחות/יותר לפי הצורך
-        alignment=ft.alignment.center_right
-    )
-
+    # כפתור חידוש – שולח את השורה הזו כ-prev_row
+    row = None  # קודם נגדיר משתנה ריק
+    def build_row():
+        nonlocal row
+        row = ft.Container(
+            content=ft.Column([
+                ft.Text(title, size=17, weight=ft.FontWeight.BOLD, color=PRIMARY),
+                ft.Row([
+                    thumb,
+                    ft.Column([
+                        ft.Stack([
+                            progress_bar,
+                            ft.Container(progress_text, alignment=ft.alignment.center)
+                        ]),
+                        status_text
+                    ], spacing=8, expand=True),
+                    ft.Column([resume_btn, cancel_btn, open_folder_btn], spacing=6, alignment=ft.MainAxisAlignment.END)
+                ], spacing=18, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ], spacing=10),
+            bgcolor="#E3F2FD",
+            border_radius=10,
+            padding=12,
+            margin=ft.Margin(0, 0, 0, 0),
+            alignment=ft.alignment.center_right
+        )
+        resume_btn = ft.IconButton(
+            ft.Icons.REFRESH,
+            tooltip="חידוש הורדה",
+            on_click=lambda e: retry_download(
+                e, actual_url, actual_title, actual_thumbnail, attempts, row, downloads_column, page
+            )
+        )
+    build_row()
     downloads_column.controls.insert(0, row)
     page.update()
 
@@ -287,11 +303,21 @@ def add_download_row(page, downloads_column, url, title, thumbnail_url, format_o
             page, url, format_option, dest_dir_value,
             progress_bar, progress_text, status_text,
             show_snackbar, None, download_id, cancel_event,
-            title, ext 
+            title, ext,
+            row 
         ),
         daemon=True
     ).start()
+   
 
+def retry_download(e, url, title, thumbnail_url, attempts, row, downloads_column, page):
+    # הסר את השורה הישנה
+    if row in downloads_column.controls:
+        downloads_column.controls.remove(row)
+        page.update()
+    # קרא שוב לפונקציה שמבצעת הורדה רגילה
+    do_download_with_progress(url, title, thumbnail_url, attempts)
+    
 def main(page: ft.Page):
     BG = "#F6FFF6"
     page.title = "Easy download YouTube"
@@ -349,6 +375,30 @@ def main(page: ft.Page):
     page.overlay.append(dlg)
 
 
+    def on_shortcut_file_result(e: ft.FilePickerResultEvent):
+        urls = []
+        if e.files:
+            for f in e.files:
+                shortcut_path = f.path
+                url = extract_url_from_shortcut_file(shortcut_path)
+                if url:
+                    urls.append(url)
+            if urls:
+                # הוסף כל קישור בשורה חדשה (גם אם יש קישורים קודמים)
+                if url_input.value.strip():
+                    url_input.value += "\n" + "\n".join(urls)
+                else:
+                    url_input.value = "\n".join(urls)
+                page.update()
+                show_snackbar(page, f"נמצאו {len(urls)} קישורים!", True)
+            else:
+                show_snackbar(page, "לא נמצאו קישורים תקינים בקבצים.", False)
+
+    shortcut_picker = ft.FilePicker()
+    shortcut_picker.on_result = on_shortcut_file_result  # רק אחרי ההגדרה!
+    page.overlay.append(shortcut_picker)
+
+
     def choose_folder(e):
         def set_dir(res: ft.FilePickerResultEvent):
             if res.path:
@@ -361,7 +411,7 @@ def main(page: ft.Page):
     choose_folder_btn = ft.ElevatedButton(
         "תיקיית יעד", icon=ft.Icons.FOLDER_OPEN, bgcolor=SECONDARY, color=PRIMARY, on_click=choose_folder
     )
-
+    
     def show_playlist_dialog(url, download_attempts, do_download, title, thumbnail_url):
         def handle_choice(e):
             choice = e.control.text
@@ -381,26 +431,42 @@ def main(page: ft.Page):
                         daemon=True
                     ).start()
             elif choice == "הורד רק את הסרטון הזה":
-                    single_url = extract_single_video_url(url)
-                    threading.Thread(
-                        target=do_download,
-                        args=(single_url, title, thumbnail_url, download_attempts),
-                        daemon=True
-                    ).start()
+                single_url = extract_single_video_url(url)
+                threading.Thread(
+                    target=do_download,
+                    args=(single_url, title, thumbnail_url, download_attempts),
+                    daemon=True
+                ).start()
 
         action_button_style = ft.ButtonStyle(color=ft.Colors.BLUE)
         banner = ft.Banner(
             bgcolor=ft.Colors.AMBER_100,
-            leading=ft.Icon(ft.Icons.QUEUE_PLAY_NEXT, color=ft.Colors.AMBER, size=40),
-            content=ft.Text("זיהינו קישור לפלייליסט. מה תרצה להוריד?", color=ft.Colors.BLACK),
+            content=ft.Row(
+                [
+                    # האייקון בימין
+                    ft.Icon(ft.Icons.QUEUE_PLAY_NEXT, color=ft.Colors.AMBER, size=40),
+                    # הטקסט בשמאל
+                    ft.Container(
+                        content=ft.Text(
+                            "הקישור שזוהה מכיל פלייליסט בחר את אפשרות ההורדה",
+                            color=ft.Colors.BLACK,
+                            text_align=ft.TextAlign.RIGHT,
+                        ),
+                        alignment=ft.alignment.center_right,
+                        expand=True,
+                    ),
+                ],
+                alignment=ft.MainAxisAlignment.END,  # יישור כללי לימין
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
             actions=[
-                ft.TextButton(text="הורד את כל הפלייליסט", style=action_button_style, on_click=handle_choice),
-                ft.TextButton(text="הורד רק את הסרטון הזה", style=action_button_style, on_click=handle_choice),
                 ft.TextButton(text="ביטול", style=action_button_style, on_click=lambda e: page.close(banner)),
+                ft.TextButton(text="הורד רק את הסרטון הזה", style=action_button_style, on_click=handle_choice),
+                ft.TextButton(text="הורד את כל הפלייליסט", style=action_button_style, on_click=handle_choice),
             ],
         )
         page.open(banner)
-        
+    
     def open_log(e):
         try:
             os.startfile(LOG_FILE)
@@ -464,117 +530,134 @@ def main(page: ft.Page):
             f.write(f"אתחול לוג: {datetime.now()}\n")
 
         for url in urls:
-            # שליפת שם ותמונה
             title, thumbnail_url = fetch_title_and_thumbnail(url)
             if not title or title.strip() == "":
                 title = "הורדה"
-
-            # יצירת פסי התקדמות ופקדים לכל קישור
-            progress_bar = ft.ProgressBar( color=PRIMARY, bgcolor=SECONDARY, value=0, bar_height=58)#width=460,
-            progress_text = ft.Text("0%", size=16, color=PRIMARY, weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER)#, width=250
-            status_text = ft.Text("מוריד...", size=14, color=TEXT)
-            cancel_event = threading.Event()
-            download_id = str(uuid.uuid4())
-
-            def cancel_download(ev, ce=cancel_event):
-                ce.set()
-
-            def open_folder(ev):
-                folder = dest_dir.value
-                try:
-                    if os.name == 'nt':
-                        os.startfile(folder)
-                    elif os.name == 'posix':
-                        subprocess.Popen(['xdg-open', folder])
-                    else:
-                        show_snackbar(page, "לא נתמך", False)
-                except Exception:
-                    show_snackbar(page, "לא ניתן לפתוח תיקיה", False)
-
-            cancel_btn = ft.IconButton(ft.Icons.CANCEL, tooltip="ביטול", on_click=cancel_download)
-            open_folder_btn = ft.IconButton(ft.Icons.FOLDER_OPEN, tooltip="פתח תיקיה", on_click=open_folder)
-
-            row = ft.Container(
-                content=ft.Column([
-                    ft.Text(title, size=17, weight=ft.FontWeight.BOLD, color=PRIMARY),
-                    ft.Row([
-                        ft.Image(src=thumbnail_url or "assets/no_thumbnail.png", width=100, height=70, border_radius=8, fit=ft.ImageFit.COVER),
-                        ft.Column([
-                            ft.Stack([
-                                progress_bar,
-                                ft.Container(progress_text, alignment=ft.alignment.center)
-                            ]),
-                            status_text
-                        ], spacing=8, expand=True),
-                        ft.Column([cancel_btn, open_folder_btn], spacing=6, alignment=ft.MainAxisAlignment.END)
-                    ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-                ], spacing=10),
-                bgcolor="#E3F2FD",
-                border_radius=10,
-                padding=12,
-                margin=ft.Margin(0, 0, 0, 0),
-                #width=680,
-                alignment=ft.alignment.center_right
-            )
-            downloads_column.controls.insert(0, row)
-            page.update()
-
-            # רשימת נסיונות פורמט
-            download_attempts = []
+            
+            # הגדרת הורדות חכמות
             if value == "mp4":
-                download_attempts.append([
-                    "yt-dlp",
-                    "--no-check-certificate",
-                    "-f", "best[ext=mp4][vcodec^=avc1]",
-                    "-P", dest_dir.value,
-                    "--ffmpeg-location", ffmpeg_actual,
-                    "-o", output_template
-                ])
-                download_attempts.append([
-                    "yt-dlp",
-                    "--no-check-certificate",
-                    "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4",
-                    "--merge-output-format", "mp4",
-                    "-P", dest_dir.value,
-                    "--ffmpeg-location", ffmpeg_actual,
-                    "-o", output_template
-                ])
+                download_attempts = [
+                    [
+                        "yt-dlp",
+                        "--no-check-certificate",
+                        "-f", "best[ext=mp4]",
+                        "-P", dest_dir.value,
+                        "--ffmpeg-location", ffmpeg_actual,
+                        "-o", output_template
+                    ]
+                ]
             else:
-                download_attempts.append([
-                    "yt-dlp", "--no-check-certificate",
-                    "-x", "--audio-format", "mp3",
-                    "--embed-thumbnail", "--add-metadata",
-                    "-P", dest_dir.value,
-                    "--ffmpeg-location", ffmpeg_actual,
-                    "-o", output_template
-                ])
+                download_attempts = [
+                    [
+                        "yt-dlp", "--no-check-certificate",
+                        "-x", "--audio-format", "mp3",
+                        "--embed-thumbnail", "--add-metadata",
+                        "-P", dest_dir.value,
+                        "--ffmpeg-location", ffmpeg_actual,
+                        "-o", output_template
+                    ]
+                ]
 
-            def do_download(actual_url, actual_title, actual_thumbnail, attempts, ce=cancel_event):
-                for format_option in attempts:
-                    success = run_download_with_cancel(
-                        page, actual_url, format_option, dest_dir.value,
-                        progress_bar, progress_text, status_text,
-                        show_snackbar, None, download_id, ce,
-                        actual_title, ext
-                    )
-                    if success:
-                        break
-                else:
-                    status_text.value = "שגיאה: כל נסיונות ההורדה כשלו."
-                    status_text.update()
-                    show_snackbar(page, "שגיאה: כל נסיונות ההורדה כשלו.", False)
-
-            # תמיכה בפלייליסטים עבור כל קישור
+            # אם זה פלייליסט, פתח דיאלוג לבחירה
             if is_playlist(url):
-                # פתח דיאלוג בחירה – לא מתחיל מיד להוריד
-                show_playlist_dialog(url, download_attempts, do_download, title, thumbnail_url)
+                show_playlist_dialog(
+                    url, 
+                    download_attempts, 
+                    lambda a_url, a_title, a_thumb, atts: do_download_with_progress(
+                        a_url, a_title, a_thumb, atts, dest_dir.value, ext, downloads_column, page
+                    ),
+                    title, 
+                    thumbnail_url
+                )
             else:
-                threading.Thread(
-                    target=do_download,
-                    args=(url, title, thumbnail_url, download_attempts),
-                    daemon=True
-                ).start()
+                # כאן תפעיל את ההורדה!
+                do_download_with_progress(
+                    url, title, thumbnail_url, download_attempts,
+                    dest_dir.value, ext, downloads_column, page
+                )
 
+    def do_download_with_progress(
+        actual_url, actual_title, actual_thumbnail, attempts, dest_dir, ext, downloads_column, page
+    ):
+        progress_bar = ft.ProgressBar(color=PRIMARY, bgcolor=SECONDARY, value=0, bar_height=58)
+        progress_text = ft.Text("0%", size=16, color=PRIMARY, weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER)
+        status_text = ft.Text("מוריד...", size=14, color=TEXT)
+        cancel_event = threading.Event()
+        download_id = str(uuid.uuid4())
+
+        # נגדיר את השורה כמשתנה שנוכל לסגור עליו
+        row = None
+
+        def cancel_download(ev):
+            cancel_event.set()
+
+        def open_folder(ev):
+            folder = dest_dir
+            try:
+                if os.name == 'nt':
+                    os.startfile(folder)
+                elif os.name == 'posix':
+                    subprocess.Popen(['xdg-open', folder])
+                else:
+                    show_snackbar(page, "לא נתמך", False)
+            except Exception:
+                show_snackbar(page, "לא ניתן לפתוח תיקיה", False)
+
+        def retry(ev):
+            # מסיר את השורה הישנה ויוצר אחת חדשה עם אותם ערכים
+            if row in downloads_column.controls:
+                downloads_column.controls.remove(row)
+                page.update()
+            do_download_with_progress(
+                actual_url, actual_title, actual_thumbnail, attempts, dest_dir, ext, downloads_column, page
+            )
+
+        cancel_btn = ft.IconButton(ft.Icons.CANCEL, tooltip="ביטול", on_click=cancel_download)
+        open_folder_btn = ft.IconButton(ft.Icons.FOLDER_OPEN, tooltip="פתח תיקיה", on_click=open_folder)
+        resume_btn = ft.IconButton(ft.Icons.REFRESH, tooltip="חידוש הורדה", on_click=retry)
+
+        row = ft.Container(
+            content=ft.Column([
+                ft.Text(actual_title, size=17, weight=ft.FontWeight.BOLD, color=PRIMARY),
+                ft.Row([
+                    ft.Image(src=actual_thumbnail or "assets/no_thumbnail.png", width=100, height=70, border_radius=8, fit=ft.ImageFit.COVER),
+                    ft.Column([
+                        ft.Stack([
+                            progress_bar,
+                            ft.Container(progress_text, alignment=ft.alignment.center)
+                        ]),
+                        status_text
+                    ], spacing=8, expand=True),
+                    ft.Column([resume_btn, cancel_btn, open_folder_btn], spacing=6, alignment=ft.MainAxisAlignment.END)
+                ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ], spacing=10),
+            bgcolor="#E3F2FD",
+            border_radius=10,
+            padding=12,
+            margin=ft.Margin(0, 0, 0, 0),
+            alignment=ft.alignment.center_right
+        )
+        downloads_column.controls.insert(0, row)
+        page.update()
+
+        def do_download_inner():
+            for format_option in attempts:
+                success = run_download_with_cancel(
+                    page, actual_url, format_option, dest_dir,
+                    progress_bar, progress_text, status_text,
+                    show_snackbar, None, download_id, cancel_event,
+                    actual_title, ext,
+                    row
+                )
+                if success:
+                    break
+            else:
+                status_text.value = "שגיאה: כל נסיונות ההורדה כשלו."
+                status_text.update()
+                show_snackbar(page, "שגיאה: כל נסיונות ההורדה כשלו.", False)
+
+        threading.Thread(target=do_download_inner, daemon=True).start()
+    
     top_row = ft.Row(
         [
             url_input,
@@ -584,6 +667,13 @@ def main(page: ft.Page):
                 bgcolor=SECONDARY,        
                 icon_color=PRIMARY,        
                 tooltip="הורד"              
+            ),
+            ft.IconButton(
+                icon=ft.Icons.UPLOAD_FILE,
+                tooltip="יבא מקובץ",
+                bgcolor=SECONDARY,
+                icon_color=PRIMARY,
+                on_click=lambda e: shortcut_picker.pick_files(allowed_extensions=["url", "desktop"], allow_multiple=True)
             ),
             open_log_btn,
         ],
